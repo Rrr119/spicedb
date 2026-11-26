@@ -67,6 +67,8 @@ func (c *Config) ToOption() ConfigOption {
 		to.StoredSchemaCacheConfig = c.StoredSchemaCacheConfig
 		to.SchemaPrefixesRequired = c.SchemaPrefixesRequired
 		to.ExperimentalSchemaMode = c.ExperimentalSchemaMode
+		to.ExperimentalRelationshipVersion = c.ExperimentalRelationshipVersion
+		to.ExperimentalRelationshipDualWrite = c.ExperimentalRelationshipDualWrite
 		to.DispatchServer = c.DispatchServer
 		to.DispatchMaxDepth = c.DispatchMaxDepth
 		to.GlobalDispatchConcurrencyLimit = c.GlobalDispatchConcurrencyLimit
@@ -254,6 +256,16 @@ func (c *Config) DebugMap() map[string]any {
 		debugMap["ExperimentalSchemaMode"] = "(empty)"
 	} else {
 		debugMap["ExperimentalSchemaMode"] = c.ExperimentalSchemaMode
+	}
+	if c.ExperimentalRelationshipVersion == "" {
+		debugMap["ExperimentalRelationshipVersion"] = "(empty)"
+	} else {
+		debugMap["ExperimentalRelationshipVersion"] = c.ExperimentalRelationshipVersion
+	}
+	if c.ExperimentalRelationshipDualWrite == nil {
+		debugMap["ExperimentalRelationshipDualWrite"] = "nil"
+	} else {
+		debugMap["ExperimentalRelationshipDualWrite"] = fmt.Sprintf("(slice of size %d)", len(c.ExperimentalRelationshipDualWrite))
 	}
 	if dm, ok := any(&c.DispatchServer).(interface {
 		DebugMap() map[string]any
@@ -663,6 +675,27 @@ func WithSchemaPrefixesRequired(schemaPrefixesRequired bool) ConfigOption {
 func WithExperimentalSchemaMode(experimentalSchemaMode string) ConfigOption {
 	return func(c *Config) {
 		c.ExperimentalSchemaMode = experimentalSchemaMode
+	}
+}
+
+// WithExperimentalRelationshipVersion returns an option that can set ExperimentalRelationshipVersion on a Config
+func WithExperimentalRelationshipVersion(experimentalRelationshipVersion string) ConfigOption {
+	return func(c *Config) {
+		c.ExperimentalRelationshipVersion = experimentalRelationshipVersion
+	}
+}
+
+// WithExperimentalRelationshipDualWrite returns an option that can append ExperimentalRelationshipDualWrites to Config.ExperimentalRelationshipDualWrite
+func WithExperimentalRelationshipDualWrite(experimentalRelationshipDualWrite string) ConfigOption {
+	return func(c *Config) {
+		c.ExperimentalRelationshipDualWrite = append(c.ExperimentalRelationshipDualWrite, experimentalRelationshipDualWrite)
+	}
+}
+
+// SetExperimentalRelationshipDualWrite returns an option that can set ExperimentalRelationshipDualWrite on a Config
+func SetExperimentalRelationshipDualWrite(experimentalRelationshipDualWrite []string) ConfigOption {
+	return func(c *Config) {
+		c.ExperimentalRelationshipDualWrite = experimentalRelationshipDualWrite
 	}
 }
 

@@ -42,6 +42,14 @@ type Config struct {
 	// schema. Use datalayer.SchemaModeReadNewWriteNew (or *Both) for the unified schema.
 	SchemaMode datalayer.SchemaMode
 
+	// RelationshipVersion is the default relationship storage version. The zero value
+	// preserves the legacy v1 relationship layout.
+	RelationshipVersion datalayer.RelationshipVersion
+
+	// RelationshipDualWrite lists additional relationship versions that receive every
+	// write. It never changes which version is read.
+	RelationshipDualWrite []datalayer.RelationshipVersion
+
 	// SchemaCacheMaxCostBytes, when > 0, enables an in-memory stored-schema cache of the
 	// given size in bytes. Caching the stored schema across checks is what allows
 	// schema-derived caches (e.g. compiled caveats) to persist; strongly recommended when
@@ -88,7 +96,10 @@ func NewPermissions(cfg Config) (*Permissions, error) {
 	}
 
 	var schemaCache cache.Cache[datalayer.SchemaCacheKey, *datastore.ReadOnlyStoredSchema]
-	dlOpts := []datalayer.DataLayerOption{datalayer.WithSchemaMode(cfg.SchemaMode)}
+	dlOpts := []datalayer.DataLayerOption{
+		datalayer.WithSchemaMode(cfg.SchemaMode),
+		datalayer.WithRelationshipVersioning(cfg.RelationshipVersion, cfg.RelationshipDualWrite...),
+	}
 	if cfg.SchemaCacheMaxCostBytes > 0 {
 		sc, err := cache.NewStandardCache[datalayer.SchemaCacheKey, *datastore.ReadOnlyStoredSchema](&cache.Config{
 			MaxCost: cfg.SchemaCacheMaxCostBytes,
@@ -132,6 +143,10 @@ type CheckRequest struct {
 	SubjectID       string
 	SubjectRelation string // optional; defaults to the ellipsis ("...") relation
 	CaveatContext   map[string]any
+
+	// RelationshipVersion selects the relationship storage version for this check.
+	// Empty uses the Permissions default.
+	RelationshipVersion datalayer.RelationshipVersion
 }
 
 // CheckResult is the outcome of a check.
@@ -147,6 +162,9 @@ type CheckResult struct {
 
 // Check runs a single, fully-consistent permission check in-process.
 func (p *Permissions) Check(ctx context.Context, req CheckRequest) (CheckResult, error) {
+	if req.RelationshipVersion != "" {
+		ctx = datalayer.ContextWithRelationshipVersion(ctx, req.RelationshipVersion)
+	}
 	ctx = datalayer.ContextWithDataLayer(ctx, p.dl)
 
 	// The datalayer head revision yields the schema-mode-appropriate schema hash (a real

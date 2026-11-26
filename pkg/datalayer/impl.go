@@ -3,6 +3,7 @@ package datalayer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	v1 "github.com/authzed/authzed-go/proto/authzed/api/v1"
@@ -60,9 +61,10 @@ func WithSchemaCache(cache SchemaCache) DataLayerOption {
 // NewDataLayer creates a new DataLayer wrapping a datastore.Datastore.
 func NewDataLayer(ds datastore.Datastore, opts ...DataLayerOption) DataLayer {
 	d := &defaultDataLayer{
-		ds:         ds,
-		schemaMode: SchemaModeReadLegacyWriteLegacy,
-		cache:      noopSchemaCache{},
+		ds:                   ds,
+		schemaMode:           SchemaModeReadLegacyWriteLegacy,
+		cache:                noopSchemaCache{},
+		relationshipVersions: newRelationshipVersionConfig(RelationshipVersionV1),
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -72,10 +74,11 @@ func NewDataLayer(ds datastore.Datastore, opts ...DataLayerOption) DataLayer {
 
 // defaultDataLayer wraps a datastore.Datastore and implements DataLayer.
 type defaultDataLayer struct {
-	ds             datastore.Datastore
-	schemaMode     SchemaMode
-	cache          storedSchemaCache
-	lastSchemaHash atomic.Pointer[string] // most recently observed non-bypass schema hash
+	ds                   datastore.Datastore
+	schemaMode           SchemaMode
+	cache                storedSchemaCache
+	relationshipVersions relationshipVersionConfig
+	lastSchemaHash       atomic.Pointer[string] // most recently observed non-bypass schema hash
 }
 
 // observeSchemaHash stores h as the most recently observed schema hash.
@@ -101,11 +104,12 @@ func (d *defaultDataLayer) SnapshotReader(rev datastore.Revision, schemaHash Sch
 	}
 	d.observeSchemaHash(schemaHash)
 	return &revisionedReader{
-		reader:     d.ds.SnapshotReader(rev),
-		rev:        rev,
-		schemaMode: d.schemaMode,
-		schemaHash: schemaHash,
-		cache:      d.cache,
+		reader:               d.ds.SnapshotReader(rev),
+		rev:                  rev,
+		schemaMode:           d.schemaMode,
+		schemaHash:           schemaHash,
+		cache:                d.cache,
+		relationshipVersions: d.relationshipVersions,
 	}
 }
 
@@ -140,10 +144,11 @@ func (d *defaultDataLayer) ReadWriteTx(ctx context.Context, fn TxUserFunc, opts 
 		rev, err = d.ds.ReadWriteTx(ctx, func(ctx context.Context, rwt datastore.ReadWriteTransaction) error {
 			pendingHash, pendingSchema = "", nil // reset on inner retry
 			return fn(ctx, &readWriteTransaction{
-				rwt:              rwt,
-				schemaMode:       d.schemaMode,
-				cache:            d.cache,
-				preconditionHash: preconditionHash,
+				rwt:                  rwt,
+				schemaMode:           d.schemaMode,
+				cache:                d.cache,
+				preconditionHash:     preconditionHash,
+				relationshipVersions: d.relationshipVersions,
 				onSchemaWritten: func(h SchemaHash, s *datastore.ReadOnlyStoredSchema) {
 					pendingHash, pendingSchema = h, s
 				},
@@ -219,13 +224,28 @@ func (d *defaultDataLayer) RevisionFromString(serialized string) (datastore.Revi
 }
 
 func (d *defaultDataLayer) Watch(ctx context.Context, afterRevision datastore.Revision, opts datastore.WatchOptions) (<-chan datastore.RevisionChanges, <-chan error) {
+	version, err := d.relationshipVersions.readVersion(ctx)
+	if err != nil {
+		changes := make(chan datastore.RevisionChanges)
+		errs := make(chan error, 1)
+		close(changes)
+		errs <- err
+		close(errs)
+		return changes, errs
+	}
+
+	var changes <-chan datastore.RevisionChanges
+	var errs <-chan error
+
 	// The datastore's WatchSchema emits changes from the legacy schema storage. When reading
 	// schema from the unified stored schema, schema changes must be sourced from it instead.
 	if d.schemaMode.ReadsFromNew() && opts.Content&datastore.WatchSchema == datastore.WatchSchema {
-		return watchViaStoredSchema(ctx, d.ds, afterRevision, opts)
+		changes, errs = watchViaStoredSchema(ctx, d.ds, afterRevision, opts)
+	} else {
+		changes, errs = d.ds.Watch(ctx, afterRevision, opts)
 	}
 
-	return d.ds.Watch(ctx, afterRevision, opts)
+	return relationshipChangesForVersion(ctx, changes, errs, version, opts.Content)
 }
 
 func (d *defaultDataLayer) ReadyState(ctx context.Context) (datastore.ReadyState, error) {
@@ -258,11 +278,12 @@ func (d *defaultDataLayer) Close() error {
 
 // revisionedReader wraps a datastore.Reader and implements RevisionedReader.
 type revisionedReader struct {
-	reader     datastore.Reader
-	rev        datastore.Revision
-	schemaMode SchemaMode
-	schemaHash SchemaHash
-	cache      storedSchemaCache
+	reader               datastore.Reader
+	rev                  datastore.Revision
+	schemaMode           SchemaMode
+	schemaHash           SchemaHash
+	cache                storedSchemaCache
+	relationshipVersions relationshipVersionConfig
 }
 
 // The reads below assert, in CI builds, that the calling goroutine is not iterating over a
@@ -278,19 +299,63 @@ func (r *revisionedReader) ReadSchema(ctx context.Context) (SchemaReader, error)
 }
 
 func (r *revisionedReader) QueryRelationships(ctx context.Context, filter datastore.RelationshipsFilter, opts ...options.QueryOptionsOption) (datastore.RelationshipIterator, error) {
-	it, err := r.reader.QueryRelationships(ctx, filter, opts...)
+	version, err := r.relationshipVersions.readVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return trackHeldIterator("QueryRelationships", it), nil
+	return r.QueryRelationshipsAtVersion(ctx, version, filter, opts...)
+}
+
+func (r *revisionedReader) QueryRelationshipsAtVersion(
+	ctx context.Context,
+	version RelationshipVersion,
+	filter datastore.RelationshipsFilter,
+	opts ...options.QueryOptionsOption,
+) (datastore.RelationshipIterator, error) {
+	version = normalizeRelationshipVersion(version)
+	if !version.IsValid() {
+		return nil, fmt.Errorf("invalid relationship version %q", version)
+	}
+
+	it, err := r.reader.QueryRelationships(
+		ctx,
+		version.translateRelationshipsFilter(filter),
+		version.translateQueryOptions(opts...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return trackHeldIterator("QueryRelationships", relationshipIteratorForVersion(it, version)), nil
 }
 
 func (r *revisionedReader) ReverseQueryRelationships(ctx context.Context, subjectsFilter datastore.SubjectsFilter, opts ...options.ReverseQueryOptionsOption) (datastore.RelationshipIterator, error) {
-	it, err := r.reader.ReverseQueryRelationships(ctx, subjectsFilter, opts...)
+	version, err := r.relationshipVersions.readVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return trackHeldIterator("ReverseQueryRelationships", it), nil
+	return r.ReverseQueryRelationshipsAtVersion(ctx, version, subjectsFilter, opts...)
+}
+
+func (r *revisionedReader) ReverseQueryRelationshipsAtVersion(
+	ctx context.Context,
+	version RelationshipVersion,
+	subjectsFilter datastore.SubjectsFilter,
+	opts ...options.ReverseQueryOptionsOption,
+) (datastore.RelationshipIterator, error) {
+	version = normalizeRelationshipVersion(version)
+	if !version.IsValid() {
+		return nil, fmt.Errorf("invalid relationship version %q", version)
+	}
+
+	it, err := r.reader.ReverseQueryRelationships(
+		ctx,
+		version.translateSubjectsFilter(subjectsFilter),
+		version.translateReverseQueryOptions(opts...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return trackHeldIterator("ReverseQueryRelationships", relationshipIteratorForVersion(it, version)), nil
 }
 
 func (r *revisionedReader) CountRelationships(ctx context.Context, name string) (int, error) {
@@ -305,9 +370,10 @@ func (r *revisionedReader) LookupCounters(ctx context.Context) ([]datastore.Rela
 
 // readWriteTransaction wraps a datastore.ReadWriteTransaction and implements ReadWriteTransaction.
 type readWriteTransaction struct {
-	rwt        datastore.ReadWriteTransaction
-	schemaMode SchemaMode
-	cache      storedSchemaCache
+	rwt                  datastore.ReadWriteTransaction
+	schemaMode           SchemaMode
+	cache                storedSchemaCache
+	relationshipVersions relationshipVersionConfig
 
 	// onSchemaWritten is called by WriteSchema after a successful datastore write.
 	// ReadWriteTx sets this to capture the written schema for post-commit cache update.
@@ -330,11 +396,61 @@ func (t *readWriteTransaction) ReadSchema(ctx context.Context) (SchemaReader, er
 }
 
 func (t *readWriteTransaction) QueryRelationships(ctx context.Context, filter datastore.RelationshipsFilter, opts ...options.QueryOptionsOption) (datastore.RelationshipIterator, error) {
-	return t.rwt.QueryRelationships(ctx, filter, opts...)
+	version, err := t.relationshipVersions.readVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return t.QueryRelationshipsAtVersion(ctx, version, filter, opts...)
+}
+
+func (t *readWriteTransaction) QueryRelationshipsAtVersion(
+	ctx context.Context,
+	version RelationshipVersion,
+	filter datastore.RelationshipsFilter,
+	opts ...options.QueryOptionsOption,
+) (datastore.RelationshipIterator, error) {
+	version = normalizeRelationshipVersion(version)
+	if !version.IsValid() {
+		return nil, fmt.Errorf("invalid relationship version %q", version)
+	}
+	it, err := t.rwt.QueryRelationships(
+		ctx,
+		version.translateRelationshipsFilter(filter),
+		version.translateQueryOptions(opts...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return relationshipIteratorForVersion(it, version), nil
 }
 
 func (t *readWriteTransaction) ReverseQueryRelationships(ctx context.Context, subjectsFilter datastore.SubjectsFilter, opts ...options.ReverseQueryOptionsOption) (datastore.RelationshipIterator, error) {
-	return t.rwt.ReverseQueryRelationships(ctx, subjectsFilter, opts...)
+	version, err := t.relationshipVersions.readVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return t.ReverseQueryRelationshipsAtVersion(ctx, version, subjectsFilter, opts...)
+}
+
+func (t *readWriteTransaction) ReverseQueryRelationshipsAtVersion(
+	ctx context.Context,
+	version RelationshipVersion,
+	subjectsFilter datastore.SubjectsFilter,
+	opts ...options.ReverseQueryOptionsOption,
+) (datastore.RelationshipIterator, error) {
+	version = normalizeRelationshipVersion(version)
+	if !version.IsValid() {
+		return nil, fmt.Errorf("invalid relationship version %q", version)
+	}
+	it, err := t.rwt.ReverseQueryRelationships(
+		ctx,
+		version.translateSubjectsFilter(subjectsFilter),
+		version.translateReverseQueryOptions(opts...)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return relationshipIteratorForVersion(it, version), nil
 }
 
 func (t *readWriteTransaction) CountRelationships(ctx context.Context, name string) (int, error) {
@@ -346,15 +462,346 @@ func (t *readWriteTransaction) LookupCounters(ctx context.Context) ([]datastore.
 }
 
 func (t *readWriteTransaction) WriteRelationships(ctx context.Context, mutations []tuple.RelationshipUpdate) error {
-	return t.rwt.WriteRelationships(ctx, mutations)
+	versions, err := t.relationshipVersions.writeVersions(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(versions) == 1 && versions[0] == RelationshipVersionV1 {
+		return t.rwt.WriteRelationships(ctx, mutations)
+	}
+
+	for _, version := range versions {
+		translated := make([]tuple.RelationshipUpdate, 0, len(mutations))
+		for _, mutation := range mutations {
+			mutation.Relationship = version.toStorageRelationship(mutation.Relationship)
+			translated = append(translated, mutation)
+		}
+		if err := t.rwt.WriteRelationships(ctx, translated); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *readWriteTransaction) DeleteRelationships(ctx context.Context, filter *v1.RelationshipFilter, opts ...options.DeleteOptionsOption) (datastore.DeleteRelationshipsResult, error) {
-	return t.rwt.DeleteRelationships(ctx, filter, opts...)
+	versions, err := t.relationshipVersions.writeVersions(ctx)
+	if err != nil {
+		return datastore.DeleteRelationshipsResult{}, err
+	}
+	return t.deleteRelationshipsAtVersion(ctx, versions, filter, opts...)
 }
 
 func (t *readWriteTransaction) BulkLoad(ctx context.Context, iter datastore.BulkWriteRelationshipSource) (uint64, error) {
-	return t.rwt.BulkLoad(ctx, iter)
+	versions, err := t.relationshipVersions.writeVersions(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(versions) == 1 && versions[0] == RelationshipVersionV1 {
+		return t.rwt.BulkLoad(ctx, iter)
+	}
+
+	relationships := make([]tuple.Relationship, 0)
+	for {
+		relationship, err := iter.Next(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if relationship == nil {
+			break
+		}
+		relationships = append(relationships, *relationship)
+	}
+
+	var total uint64
+	for _, version := range versions {
+		source := &sliceBulkRelationshipSource{relationships: relationships, version: version}
+		written, err := t.rwt.BulkLoad(ctx, source)
+		if err != nil {
+			return total, err
+		}
+		if written > total {
+			total = written
+		}
+	}
+	return total, nil
+}
+
+type sliceBulkRelationshipSource struct {
+	relationships []tuple.Relationship
+	index         int
+	version       RelationshipVersion
+}
+
+func (s *sliceBulkRelationshipSource) Next(context.Context) (*tuple.Relationship, error) {
+	if s.index >= len(s.relationships) {
+		return nil, nil
+	}
+	relationship := s.version.toStorageRelationship(s.relationships[s.index])
+	s.index++
+	return &relationship, nil
+}
+
+func (t *readWriteTransaction) deleteRelationshipsAtVersion(
+	ctx context.Context,
+	versions []RelationshipVersion,
+	filter *v1.RelationshipFilter,
+	opts ...options.DeleteOptionsOption,
+) (datastore.DeleteRelationshipsResult, error) {
+	if filter == nil {
+		filter = &v1.RelationshipFilter{}
+	}
+
+	deleteOptions := options.NewDeleteOptionsWithOptionsAndDefaults(opts...)
+
+	if len(versions) == 1 && versions[0] == RelationshipVersionV1 {
+		return t.rwt.DeleteRelationships(ctx, filter, opts...)
+	}
+
+	var result datastore.DeleteRelationshipsResult
+	for _, version := range versions {
+		versionResult, err := t.deleteRelationshipsForVersion(ctx, version, filter, deleteOptions)
+		if err != nil {
+			return datastore.DeleteRelationshipsResult{}, err
+		}
+		if versionResult.NumDeleted > result.NumDeleted {
+			result.NumDeleted = versionResult.NumDeleted
+		}
+		result.LimitReached = result.LimitReached || versionResult.LimitReached
+		if result.Cursor == nil {
+			result.Cursor = version.logicalCursor(versionResult.Cursor)
+		}
+	}
+	return result, nil
+}
+
+func (t *readWriteTransaction) deleteRelationshipsForVersion(
+	ctx context.Context,
+	version RelationshipVersion,
+	filter *v1.RelationshipFilter,
+	deleteOptions *options.DeleteOptions,
+) (datastore.DeleteRelationshipsResult, error) {
+	if version == RelationshipVersionV1 && filter.ResourceType != "" {
+		translatedOptions := *deleteOptions
+		if translatedOptions.DeleteAfter != nil {
+			translatedOptions.DeleteAfter = version.translateCursor(translatedOptions.DeleteAfter)
+		}
+		result, err := t.rwt.DeleteRelationships(ctx, filter, translatedOptions.ToOption())
+		if err != nil {
+			return datastore.DeleteRelationshipsResult{}, err
+		}
+		result.Cursor = version.logicalCursor(result.Cursor)
+		return result, nil
+	}
+
+	if deleteOptions.IsCursoredDelete() {
+		return datastore.DeleteRelationshipsResult{}, datastore.NewCursoredDeleteNotSupportedErr(
+			"relationship-version-" + version.String(),
+		)
+	}
+
+	dsFilter, err := datastore.RelationshipsFilterFromPublicFilter(filter)
+	if err != nil {
+		return datastore.DeleteRelationshipsResult{}, err
+	}
+
+	iter, err := t.QueryRelationshipsAtVersion(ctx, version, dsFilter)
+	if err != nil {
+		return datastore.DeleteRelationshipsResult{}, err
+	}
+
+	var limit uint64
+	if deleteOptions.DeleteLimit != nil {
+		limit = *deleteOptions.DeleteLimit
+	}
+
+	mutations := make([]tuple.RelationshipUpdate, 0)
+	var last tuple.Relationship
+	limitReached := false
+	for relationship, iterErr := range iter {
+		if iterErr != nil {
+			return datastore.DeleteRelationshipsResult{}, iterErr
+		}
+		if limit > 0 && uint64(len(mutations)) == limit {
+			limitReached = true
+			break
+		}
+		mutations = append(mutations, tuple.Delete(version.toStorageRelationship(relationship)))
+		last = relationship
+	}
+
+	if len(mutations) > 0 {
+		if err := t.rwt.WriteRelationships(ctx, mutations); err != nil {
+			return datastore.DeleteRelationshipsResult{}, err
+		}
+	}
+
+	result := datastore.DeleteRelationshipsResult{
+		NumDeleted:   uint64(len(mutations)),
+		LimitReached: limitReached,
+	}
+	if len(mutations) > 0 {
+		result.Cursor = options.ToCursor(last)
+	}
+	return result, nil
+}
+
+func (t *readWriteTransaction) MigrateRelationships(
+	ctx context.Context,
+	migration RelationshipMigration,
+) (RelationshipMigrationResult, error) {
+	source := normalizeRelationshipVersion(migration.Source)
+	target := normalizeRelationshipVersion(migration.Target)
+	if !source.IsValid() {
+		return RelationshipMigrationResult{}, fmt.Errorf("invalid source relationship version %q", migration.Source)
+	}
+	if !target.IsValid() {
+		return RelationshipMigrationResult{}, fmt.Errorf("invalid target relationship version %q", migration.Target)
+	}
+	if source == target {
+		return RelationshipMigrationResult{}, fmt.Errorf("source and target relationship versions must differ")
+	}
+
+	result := RelationshipMigrationResult{}
+	if migration.Schema != nil {
+		if _, err := t.WriteSchema(
+			ctx,
+			migration.Schema.Definitions,
+			migration.Schema.SchemaText,
+			migration.Schema.CaveatTypeSet,
+		); err != nil {
+			return RelationshipMigrationResult{}, err
+		}
+		result.SchemaWritten = true
+	}
+
+	iter, err := t.QueryRelationshipsAtVersion(ctx, source, migration.Filter)
+	if err != nil {
+		return RelationshipMigrationResult{}, err
+	}
+
+	relationships := make([]tuple.Relationship, 0)
+	sourceReferences := make(map[string]struct{})
+	for relationship, iterErr := range iter {
+		if iterErr != nil {
+			return RelationshipMigrationResult{}, iterErr
+		}
+		relationships = append(relationships, relationship)
+		sourceReferences[relationshipReferenceKey(relationship)] = struct{}{}
+	}
+
+	updates := make([]tuple.RelationshipUpdate, 0, len(relationships))
+	for _, relationship := range relationships {
+		updates = append(updates, tuple.Touch(target.toStorageRelationship(relationship)))
+	}
+
+	targetIter, err := t.QueryRelationshipsAtVersion(ctx, target, migration.Filter)
+	if err != nil {
+		return RelationshipMigrationResult{}, err
+	}
+	staleDeletions := make([]tuple.RelationshipUpdate, 0)
+	for relationship, iterErr := range targetIter {
+		if iterErr != nil {
+			return RelationshipMigrationResult{}, iterErr
+		}
+		if _, ok := sourceReferences[relationshipReferenceKey(relationship)]; ok {
+			continue
+		}
+		staleDeletions = append(staleDeletions, tuple.Delete(target.toStorageRelationship(relationship)))
+	}
+
+	if len(staleDeletions) > 0 {
+		if err := t.rwt.WriteRelationships(ctx, staleDeletions); err != nil {
+			return RelationshipMigrationResult{}, err
+		}
+	}
+	if len(updates) > 0 {
+		if err := t.rwt.WriteRelationships(ctx, updates); err != nil {
+			return RelationshipMigrationResult{}, err
+		}
+	}
+
+	result.Copied = uint64(len(updates))
+	result.RemovedStale = uint64(len(staleDeletions))
+	return result, nil
+}
+
+func (t *readWriteTransaction) RollbackRelationshipMigration(
+	ctx context.Context,
+	rollback RelationshipRollback,
+) (RelationshipRollbackResult, error) {
+	target := normalizeRelationshipVersion(rollback.Target)
+	if !target.IsValid() {
+		return RelationshipRollbackResult{}, fmt.Errorf("invalid target relationship version %q", rollback.Target)
+	}
+
+	source := normalizeRelationshipVersion(rollback.Source)
+	if rollback.Source != "" && !source.IsValid() {
+		return RelationshipRollbackResult{}, fmt.Errorf("invalid source relationship version %q", rollback.Source)
+	}
+	if rollback.Source != "" && source == target {
+		return RelationshipRollbackResult{}, fmt.Errorf("source and target relationship versions must differ")
+	}
+
+	result := RelationshipRollbackResult{}
+	if rollback.Schema != nil {
+		if _, err := t.WriteSchema(
+			ctx,
+			rollback.Schema.Definitions,
+			rollback.Schema.SchemaText,
+			rollback.Schema.CaveatTypeSet,
+		); err != nil {
+			return RelationshipRollbackResult{}, err
+		}
+		result.SchemaWritten = true
+	}
+
+	targetIter, err := t.QueryRelationshipsAtVersion(ctx, target, rollback.Filter)
+	if err != nil {
+		return RelationshipRollbackResult{}, err
+	}
+
+	targetRelationships := make([]tuple.Relationship, 0)
+	for relationship, iterErr := range targetIter {
+		if iterErr != nil {
+			return RelationshipRollbackResult{}, iterErr
+		}
+		targetRelationships = append(targetRelationships, relationship)
+	}
+
+	var sourceReferences map[string]struct{}
+	if rollback.Source != "" {
+		sourceIter, err := t.QueryRelationshipsAtVersion(ctx, source, rollback.Filter)
+		if err != nil {
+			return RelationshipRollbackResult{}, err
+		}
+		sourceReferences = make(map[string]struct{})
+		for relationship, iterErr := range sourceIter {
+			if iterErr != nil {
+				return RelationshipRollbackResult{}, iterErr
+			}
+			sourceReferences[relationshipReferenceKey(relationship)] = struct{}{}
+		}
+	}
+
+	deletions := make([]tuple.RelationshipUpdate, 0, len(targetRelationships))
+	for _, relationship := range targetRelationships {
+		if sourceReferences != nil {
+			if _, ok := sourceReferences[relationshipReferenceKey(relationship)]; !ok {
+				continue
+			}
+		}
+		deletions = append(deletions, tuple.Delete(target.toStorageRelationship(relationship)))
+	}
+
+	if len(deletions) > 0 {
+		if err := t.rwt.WriteRelationships(ctx, deletions); err != nil {
+			return RelationshipRollbackResult{}, err
+		}
+	}
+	result.Deleted = uint64(len(deletions))
+	return result, nil
 }
 
 func (t *readWriteTransaction) WriteSchema(ctx context.Context, definitions []datastore.SchemaDefinition, schemaString string, caveatTypeSet *caveattypes.TypeSet) (SchemaHash, error) {
@@ -484,7 +931,20 @@ func (r *readOnlyDatastoreAdapter) RevisionFromString(serialized string) (datast
 }
 
 func (r *readOnlyDatastoreAdapter) Watch(ctx context.Context, afterRevision datastore.Revision, opts datastore.WatchOptions) (<-chan datastore.RevisionChanges, <-chan error) {
-	return r.ds.Watch(ctx, afterRevision, opts)
+	version, ok := RelationshipVersionFromContext(ctx)
+	if !ok {
+		version = RelationshipVersionV1
+	}
+	if !version.IsValid() {
+		changes := make(chan datastore.RevisionChanges)
+		errs := make(chan error, 1)
+		close(changes)
+		errs <- fmt.Errorf("invalid relationship version %q", version)
+		close(errs)
+		return changes, errs
+	}
+	changes, errs := r.ds.Watch(ctx, afterRevision, opts)
+	return relationshipChangesForVersion(ctx, changes, errs, version, opts.Content)
 }
 
 func (r *readOnlyDatastoreAdapter) ReadyState(ctx context.Context) (datastore.ReadyState, error) {

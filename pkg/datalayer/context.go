@@ -5,6 +5,8 @@ import (
 
 	middleware "github.com/grpc-ecosystem/go-grpc-middleware/v2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/authzed/ctxkey"
 )
@@ -45,11 +47,26 @@ func ContextWithDataLayer(ctx context.Context, dl DataLayer) context.Context {
 	return ctx
 }
 
+func contextWithRelationshipVersion(ctx context.Context) (context.Context, error) {
+	version, ok, err := relationshipVersionFromMetadata(ctx)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if !ok {
+		return ctx, nil
+	}
+	return ContextWithRelationshipVersion(ctx, version), nil
+}
+
 // UnaryServerInterceptor returns a new unary server interceptor that adds the
 // DataLayer to the context.
 func UnaryServerInterceptor(dl DataLayer) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		newCtx := ContextWithHandle(ctx)
+		versionCtx, err := contextWithRelationshipVersion(ctx)
+		if err != nil {
+			return nil, err
+		}
+		newCtx := ContextWithHandle(versionCtx)
 		if err := SetInContext(newCtx, dl); err != nil {
 			return nil, err
 		}
@@ -62,7 +79,11 @@ func UnaryServerInterceptor(dl DataLayer) grpc.UnaryServerInterceptor {
 func StreamServerInterceptor(dl DataLayer) grpc.StreamServerInterceptor {
 	return func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		wrapped := middleware.WrapServerStream(stream)
-		wrapped.WrappedContext = ContextWithHandle(wrapped.WrappedContext)
+		versionCtx, err := contextWithRelationshipVersion(wrapped.WrappedContext)
+		if err != nil {
+			return err
+		}
+		wrapped.WrappedContext = ContextWithHandle(versionCtx)
 		if err := SetInContext(wrapped.WrappedContext, dl); err != nil {
 			return err
 		}

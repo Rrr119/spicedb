@@ -132,6 +132,8 @@ populated however you like (the relationships/schema must already be written).
 | `Datastore` | **yes** | — | The datastore to check against. The caller owns its lifecycle (`Close` does not close it). |
 | `CaveatTypeSet` | no | `caveattypes.Default` | Must match the type set the schema/caveats were written with. |
 | `SchemaMode` | no | legacy (per-definition) | Use `datalayer.SchemaModeReadNewWriteNew` (or `*Both`) to read the unified schema. Must match how the datastore's schema was written. |
+| `RelationshipVersion` | no | `v1` (legacy layout) | Default relationship storage version to read. See [`docs/relationship-versioning.md`](../../docs/relationship-versioning.md). |
+| `RelationshipDualWrite` | no | none | Additional relationship versions to write. The read version is always written. |
 | `SchemaCacheMaxCostBytes` | no | `0` (disabled) | When `> 0`, caches the unified stored schema across checks. This is what lets schema-derived caches (compiled caveats, etc.) persist; strongly recommended whenever `SchemaMode` reads from the unified schema. |
 | `DispatchConcurrencyLimit` | no | `10` | Max concurrent sub-dispatches per check. |
 | `DispatchChunkSize` | no | `100` | Datastore query / dispatch chunk size. |

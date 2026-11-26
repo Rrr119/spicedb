@@ -101,8 +101,10 @@ type Config struct {
 	StoredSchemaCacheConfig CacheConfig `debugmap:"visible"`
 
 	// Schema options
-	SchemaPrefixesRequired bool   `debugmap:"visible"`
-	ExperimentalSchemaMode string `debugmap:"visible" default:"read-legacy-write-legacy"`
+	SchemaPrefixesRequired            bool     `debugmap:"visible"`
+	ExperimentalSchemaMode            string   `debugmap:"visible" default:"read-legacy-write-legacy"`
+	ExperimentalRelationshipVersion   string   `debugmap:"visible" default:"v1"`
+	ExperimentalRelationshipDualWrite []string `debugmap:"visible"`
 
 	// Dispatch options
 	DispatchServer                 util.GRPCServerConfig   `debugmap:"visible"`
@@ -335,6 +337,24 @@ func (c *Config) complete(ctx context.Context) (*completedServerConfig, error) {
 	}
 
 	dlOpts = append(dlOpts, datalayer.WithSchemaMode(schemaMode))
+
+	relationshipVersion := datalayer.RelationshipVersionV1
+	if c.ExperimentalRelationshipVersion != "" {
+		relationshipVersion, err = datalayer.ParseRelationshipVersion(c.ExperimentalRelationshipVersion)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	dualWriteVersions := make([]datalayer.RelationshipVersion, 0, len(c.ExperimentalRelationshipDualWrite))
+	for _, configuredVersion := range c.ExperimentalRelationshipDualWrite {
+		version, err := datalayer.ParseRelationshipVersion(configuredVersion)
+		if err != nil {
+			return nil, err
+		}
+		dualWriteVersions = append(dualWriteVersions, version)
+	}
+	dlOpts = append(dlOpts, datalayer.WithRelationshipVersioning(relationshipVersion, dualWriteVersions...))
 
 	ds = proxy.NewObservableDatastoreProxy(ds)
 	ds = proxy.NewSingleflightDatastoreProxy(ds)

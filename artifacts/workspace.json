@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid38825",
+  "B": "/home/dev/feedback/uid38825",
+  "sha": "4ff098505cd5698ac83fc36f235083e264efe413",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "authzed",
+    "repo": "spicedb",
+    "sha": "4ff098505cd5698ac83fc36f235083e264efe413"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "spicedb",
+    "cloneUrl": "https://github.com/Rrr119/spicedb.git"
+  },
+  "at": "2026-11-26T04:01:00.900Z"
+}
